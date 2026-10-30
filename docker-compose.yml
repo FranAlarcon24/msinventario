@@ -1,0 +1,61 @@
+# =============================================================================
+# Entorno simulado (staging) del microservicio msinventario
+#
+#   Cliente ─> nginx (balanceador, puerto 8080) ─> app (N réplicas)
+#
+# Uso local:   docker compose up -d --wait
+# Escalar:     docker compose up -d --scale app=3 --wait
+# Imagen:      por defecto la última publicada en GHCR; el pipeline usa IMAGE=<imagen>:sha-<commit>
+# =============================================================================
+services:
+  app:
+    image: ${IMAGE:-ghcr.io/franalarcon24/msinventario:latest}
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 256M
+    environment:
+      # La JVM usa como máximo el 75 % de la memoria asignada al contenedor
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75.0"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+    # Seguridad: sistema de archivos de solo lectura y sin escalada de privilegios
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+
+  nginx:
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    ports:
+      - "${PUERTO:-8080}:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/actuator/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+
+networks:
+  backend:
