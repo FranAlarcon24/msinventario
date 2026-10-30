@@ -31,6 +31,12 @@
 		<jacoco.version>0.8.13</jacoco.version>
 		<!-- Política de calidad: cobertura mínima de líneas exigida por el pipeline (JaCoCo check) -->
 		<cobertura.minima>0.70</cobertura.minima>
+
+		<!-- Parches de seguridad detectados por Snyk (vulnerabilidades High/Critical).
+		     Fuerzan la última versión de la misma línea que trae Spring Boot 4.1.2.
+		     Se pueden quitar cuando Spring Boot ya incluya estas versiones o superiores. -->
+		<tomcat.version>11.0.27</tomcat.version>
+		<jackson-bom.version>3.1.8</jackson-bom.version>
 	</properties>
 	<dependencies>
 		<dependency>
