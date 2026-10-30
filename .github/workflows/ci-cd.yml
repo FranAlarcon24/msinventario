@@ -5,6 +5,7 @@
 #                               ├─> SonarCloud Analysis ─> Build Jar ─> Docker Image (build + Snyk Container
 #   Run Tests (JUnit + JaCoCo) ─┘                                        + health + push GHCR)
 #                                                                         ─> Deploy Staging (Docker Compose)
+#                                                                         ─> Deploy Kubernetes (kind)
 #   (solo en PR) Dependency Review
 #
 # Cada job depende del anterior (needs): si una etapa falla, el pipeline se detiene
@@ -489,3 +490,120 @@ jobs:
       - name: Bajar entorno
         if: always()
         run: docker compose down -v
+
+  # ===========================================================================
+  # 5. Despliegue automático en Kubernetes (clúster kind = producción simulada)
+  #    Solo en push a main y después de que staging pase: usa exactamente la
+  #    misma imagen publicada y probada en los jobs anteriores.
+  # ===========================================================================
+  deploy-k8s:
+    name: Deploy Kubernetes (kind)
+    needs: [docker-image, deploy-staging]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: production   # historial de despliegues en Settings > Environments
+    permissions:
+      contents: read
+      packages: read           # descargar la imagen desde GHCR
+    env:
+      IMAGE: ${{ needs.docker-image.outputs.image }}
+      TAG: ${{ needs.docker-image.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Crear clúster Kubernetes (kind)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: inventario
+
+      - name: Login en GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cargar la imagen publicada en el clúster
+        run: |
+          docker pull "$IMAGE:$TAG"
+          kind load docker-image "$IMAGE:$TAG" --name inventario
+
+      - name: Instalar metrics-server (necesario para el HPA)
+        continue-on-error: true
+        run: |
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+          kubectl -n kube-system patch deployment metrics-server --type=json \
+            -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+      - name: Renderizar manifiestos con la imagen exacta (trazabilidad)
+        env:
+          CAUSA: "commit ${{ github.sha }} | run ${{ github.run_id }} | ${{ needs.docker-image.outputs.image }}:${{ needs.docker-image.outputs.tag }}"
+        run: |
+          sed -i "s|newName: .*|newName: ${IMAGE}|; s|newTag: .*|newTag: ${TAG}|" k8s/kustomization.yaml
+          kubectl kustomize k8s > manifiesto-renderizado.yaml
+          # Anota en el Deployment qué commit y qué ejecución lo generaron (kubectl rollout history)
+          yq -i '(select(.kind == "Deployment") | .metadata.annotations."kubernetes.io/change-cause") = strenv(CAUSA)' manifiesto-renderizado.yaml
+          yq -i '(select(.kind == "Deployment") | .spec.template.metadata.annotations."inventario/commit") = strenv(GITHUB_SHA)' manifiesto-renderizado.yaml
+          grep -n "image:" manifiesto-renderizado.yaml
+
+      - name: Desplegar en Kubernetes
+        run: |
+          kubectl apply -f manifiesto-renderizado.yaml
+          kubectl -n inventario rollout status deployment/msinventario --timeout=300s
+
+      - name: Prueba de humo a través del Service
+        run: |
+          kubectl -n inventario port-forward svc/msinventario 8081:80 > port-forward.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fs http://localhost:8081/actuator/health | grep -q '"status":"UP"' && break
+            [ "$i" -eq 30 ] && { echo "::error::El servicio no respondió UP"; exit 1; }
+            sleep 2
+          done
+          echo "Health OK"
+          curl -fsS -o /dev/null http://localhost:8081/api/productos && echo "GET /api/productos OK"
+          CODIGO=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8081/api/productos \
+            -H 'Content-Type: application/json' -d '{"nombre":"Smoke test","stock":1,"precio":1000}')
+          [ "$CODIGO" = "201" ] || { echo "::error::POST esperaba 201 y recibió $CODIGO"; exit 1; }
+          echo "POST /api/productos OK (201)"
+          CODIGO=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8081/api/productos \
+            -H 'Content-Type: application/json' -d '{"nombre":"","stock":-1,"precio":0}')
+          [ "$CODIGO" = "400" ] || { echo "::error::Validación esperaba 400 y recibió $CODIGO"; exit 1; }
+          echo "Validación OK (400)"
+
+      - name: Prueba de escalabilidad (escalar a 3 réplicas)
+        run: |
+          kubectl -n inventario scale deployment/msinventario --replicas=3
+          kubectl -n inventario rollout status deployment/msinventario --timeout=300s
+          LISTAS=$(kubectl -n inventario get deployment msinventario -o jsonpath='{.status.readyReplicas}')
+          echo "Réplicas listas: $LISTAS"
+          [ "$LISTAS" -ge 3 ] || { echo "::error::No se alcanzaron 3 réplicas listas"; exit 1; }
+
+      - name: Evidencia del despliegue
+        if: always()
+        run: |
+          {
+            echo "### Despliegue en Kubernetes (kind)"
+            echo "Imagen: \`${IMAGE}:${TAG}\` · Commit: \`${GITHUB_SHA}\`"
+            echo '```'
+            kubectl -n inventario get deploy,rs,pods,svc,hpa,pdb -o wide 2>&1 || true
+            echo
+            kubectl -n inventario rollout history deployment/msinventario 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnóstico en caso de falla
+        if: failure()
+        run: |
+          kubectl -n inventario get events --sort-by=.lastTimestamp | tail -50 || true
+          kubectl -n inventario describe pods || true
+          kubectl -n inventario logs deploy/msinventario --tail=200 || true
+
+      - name: Guardar manifiesto desplegado
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: manifiesto-k8s
+          path: manifiesto-renderizado.yaml
+          if-no-files-found: warn
