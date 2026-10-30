@@ -1,11 +1,15 @@
 # =============================================================================
 # Pipeline CI/CD - Spring Boot (msinventario)
 #
-#   Run Tests ─> Build Jar ─> Docker Image (build + health + push GHCR) ─> Deploy Staging (Docker Compose)
+#   Snyk Security Scan ─────────┐
+#                               ├─> SonarCloud Analysis ─> Build Jar ─> Docker Image (build + Snyk Container
+#   Run Tests (JUnit + JaCoCo) ─┘                                        + health + push GHCR)
+#                                                                         ─> Deploy Staging (Docker Compose)
+#   (solo en PR) Dependency Review
 #
 # Cada job depende del anterior (needs): si una etapa falla, el pipeline se detiene
 # y la imagen NO se publica.
-# Artefactos generados: test-reports, app-jar
+# Artefactos generados: test-reports, jacoco-report, snyk-report, snyk-container-report, app-jar
 # =============================================================================
 name: Spring Boot CI/CD Pipeline
 
@@ -31,10 +35,114 @@ concurrency:
 
 env:
   JAVA_VERSION: "17"
+  SNYK_VERSION: "1.1308.3"   # CLI de Snyk con versión fija (sin npm)
+  SNYK_SHA256: "5f323f45885341ea1473639859271925912ece82a2f77bc146bb4468f9838840"
 
 jobs:
   # ===========================================================================
-  # 1. Pruebas unitarias
+  # 0. Análisis de seguridad con Snyk (SCA: dependencias + SAST: código propio)
+  #    Corre en paralelo con las pruebas. Si encuentra algo alto o crítico, BLOQUEA.
+  # ===========================================================================
+  snyk-scan:
+    name: Snyk Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write   # publicar hallazgos en la pestaña Security
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}   # Token guardado en GitHub Secrets
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Verificar que existe SNYK_TOKEN
+        run: |
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::error title=Falta SNYK_TOKEN::Configura el secreto SNYK_TOKEN en Settings > Secrets and variables > Actions (y también en Dependabot)."
+            exit 1
+          fi
+
+      - name: Install Snyk CLI (versión fija + verificación de checksum)
+        run: |
+          curl --proto "=https" --tlsv1.2 -fsSL -o snyk "https://static.snyk.io/cli/v${SNYK_VERSION}/snyk-linux"
+          echo "${SNYK_SHA256}  snyk" | sha256sum -c -
+          sudo install -m 0755 snyk /usr/local/bin/snyk
+          rm snyk
+
+      - name: Authenticate Snyk CLI
+        run: snyk auth "$SNYK_TOKEN"
+
+      - name: Snyk test Java dependencies (SCA)
+        id: sca
+        continue-on-error: true   # el bloqueo se aplica en el último paso, después de guardar reportes
+        run: |
+          chmod +x mvnw
+          snyk test --severity-threshold=high \
+            --json-file-output=snyk-report.json \
+            --sarif-file-output=snyk-sca.sarif
+
+      - name: Snyk Code - análisis estático del código (SAST)
+        id: sast
+        continue-on-error: true
+        run: snyk code test --severity-threshold=high --sarif-file-output=snyk-code.sarif
+
+      - name: Upload Snyk JSON Report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snyk-report
+          path: |
+            snyk-report.json
+            snyk-*.sarif
+          if-no-files-found: warn
+
+      - name: Publicar hallazgos SCA en GitHub Security
+        if: always() && hashFiles('snyk-sca.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-sca.sarif
+          category: snyk-open-source
+
+      - name: Publicar hallazgos SAST en GitHub Security
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Snyk monitor (monitoreo continuo y alertas por correo)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: snyk monitor --project-name=msinventario --target-reference=main
+
+      - name: Quality gate de seguridad (BLOQUEO)
+        run: |
+          {
+            echo "### Quality gate de seguridad (umbral: severidad alta)"
+            echo "| Análisis | Resultado |"
+            echo "|---|---|"
+            echo "| Snyk Open Source (dependencias) | ${{ steps.sca.outcome }} |"
+            echo "| Snyk Code (SAST) | ${{ steps.sast.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.sca.outcome }}" != "success" ] || [ "${{ steps.sast.outcome }}" != "success" ]; then
+            echo "::error title=Seguridad::Se encontraron vulnerabilidades de severidad alta o crítica. Pipeline bloqueado."
+            exit 1
+          fi
+
+  # ===========================================================================
+  # 1. Pruebas unitarias e integración + cobertura con JaCoCo
+  #    "mvnw verify" falla si una prueba falla o si la cobertura de líneas
+  #    baja del mínimo definido en el pom.xml (cobertura.minima = 70 %).
   # ===========================================================================
   test:
     name: Run Tests
@@ -54,18 +162,35 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: maven      # cachea ~/.m2 entre ejecuciones
 
-      - name: Build and test
+      - name: Build and test (pruebas + reporte JaCoCo + cobertura mínima 70 %)
         run: |
           chmod +x mvnw
           ./mvnw clean verify -B -ntp
 
       - name: Publicar resultados de pruebas
         if: always()
-        uses: mikepenz/action-junit-report@v6
+        uses: mikepenz/action-junit-report@6ef3fdcfcd5f0b5d14df3e659ef19b8c6820f93d # v6.6.1
         with:
           report_paths: target/surefire-reports/TEST-*.xml
           detailed_summary: true
           include_passed: true
+
+      - name: Resumen de cobertura (JaCoCo)
+        if: always()
+        run: |
+          CSV=target/site/jacoco/jacoco.csv
+          if [ -f "$CSV" ]; then
+            read -r MISS COV < <(awk -F, 'NR>1 {m+=$8; c+=$9} END {print m, c}' "$CSV")
+            PCT=$(awk -v c="$COV" -v m="$MISS" 'BEGIN {printf "%.1f", (c*100)/(c+m)}')
+            {
+              echo "### Cobertura de pruebas (JaCoCo)"
+              echo "| Métrica | Valor |"
+              echo "|---|---|"
+              echo "| Líneas cubiertas | $COV |"
+              echo "| Líneas sin cubrir | $MISS |"
+              echo "| **Cobertura de líneas** | **$PCT %** (mínimo exigido: 70 %) |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload test reports
         if: always()
@@ -74,12 +199,93 @@ jobs:
           name: test-reports
           path: target/surefire-reports/
 
+      - name: Upload JaCoCo Report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/
+
+  # ===========================================================================
+  # Solo en Pull Requests: bloquea dependencias nuevas con vulnerabilidades
+  # ===========================================================================
+  dependency-review:
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  # ===========================================================================
+  # 1b. Análisis de calidad con SonarCloud (opcional: se omite si no hay SONAR_TOKEN)
+  #     Usa el reporte de JaCoCo para medir la cobertura y espera el Quality Gate.
+  # ===========================================================================
+  sonar-analysis:
+    name: SonarCloud Analysis
+    needs: [test, snyk-scan]   # Solo se ejecuta si pasaron las pruebas y la seguridad
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}   # Token SonarCloud desde Secrets
+    steps:
+      - name: Verificar configuración de SonarCloud
+        id: cfg
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "::warning title=SonarCloud omitido::No existe el secreto SONAR_TOKEN; se omite el análisis de SonarCloud."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # SonarCloud necesita el historial completo (blame, código nuevo)
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Run SonarCloud Analysis (con Quality Gate)
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          # Por defecto SonarCloud crea el proyecto como <owner>_<repo> en la organización <owner>
+          KEY="${SONAR_PROJECT_KEY:-${GITHUB_REPOSITORY_OWNER}_${REPO}}"
+          ORG="${SONAR_ORGANIZATION:-$OWNER}"
+          chmod +x mvnw
+          ./mvnw -B -ntp verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.projectKey="$KEY" \
+            -Dsonar.organization="$ORG" \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.qualitygate.wait=true
+
+
   # ===========================================================================
   # 2. Empaquetado de la aplicación
   # ===========================================================================
   build:
     name: Build Jar
-    needs: test   # Solo se ejecuta si pasan las pruebas
+    # Solo se ejecuta si pasan las pruebas, el análisis de seguridad y el de calidad
+    needs: [test, snyk-scan, sonar-analysis]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -115,6 +321,7 @@ jobs:
     permissions:
       contents: read
       packages: write          # publicar en GitHub Container Registry (GHCR)
+      security-events: write   # publicar hallazgos de Snyk Container en la pestaña Security
     outputs:
       image: ${{ steps.vars.outputs.image }}
       tag: ${{ steps.vars.outputs.tag }}
@@ -128,11 +335,11 @@ jobs:
           echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/msinventario" >> "$GITHUB_OUTPUT"
           echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Metadatos y etiquetas (sha, rama, latest)
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ steps.vars.outputs.image }}
           tags: |
@@ -142,7 +349,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build Docker image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
@@ -151,6 +358,48 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}   # incluye el commit (org.opencontainers.image.revision)
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install Snyk CLI (versión fija + verificación de checksum)
+        run: |
+          curl --proto "=https" --tlsv1.2 -fsSL -o snyk "https://static.snyk.io/cli/v${SNYK_VERSION}/snyk-linux"
+          echo "${SNYK_SHA256}  snyk" | sha256sum -c -
+          sudo install -m 0755 snyk /usr/local/bin/snyk
+          rm snyk
+
+      - name: Snyk Container - vulnerabilidades en la imagen
+        id: container
+        continue-on-error: true   # el bloqueo se aplica en el quality gate, después de guardar el reporte
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk container test "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}" \
+            --file=Dockerfile --severity-threshold=high \
+            --json-file-output=snyk-container-report.json \
+            --sarif-file-output=snyk-container.sarif
+
+      - name: Upload Snyk Container Report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snyk-container-report
+          path: snyk-container-report.json
+          if-no-files-found: warn
+
+      - name: Publicar hallazgos de la imagen en GitHub Security
+        if: always() && hashFiles('snyk-container.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-container.sarif
+          category: snyk-container
+
+      - name: Quality gate de la imagen (BLOQUEO)
+        run: |
+          echo "| Snyk Container (imagen) | ${{ steps.container.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.container.outcome }}" != "success" ]; then
+            echo "::error title=Imagen insegura::La imagen tiene vulnerabilidades altas o críticas. No se publica."
+            exit 1
+          fi
 
       - name: Prueba de humo de la imagen (/actuator/health)
         run: |
@@ -168,7 +417,7 @@ jobs:
 
       - name: Login en GitHub Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -209,7 +458,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
