@@ -1,0 +1,190 @@
+# =============================================================================
+# Pipeline CI/CD - Spring Boot (msinventario)
+#
+#   Run Tests ─> Build Jar ─> Docker Image (build + prueba de health + push a GHCR)
+#
+# Cada job depende del anterior (needs): si una etapa falla, el pipeline se detiene
+# y la imagen NO se publica.
+# Artefactos generados: test-reports, app-jar
+# =============================================================================
+name: Spring Boot CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main            # El pipeline completo (con publicación de la imagen) corre al hacer push a 'main'
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    branches:
+      - main            # En los PR se valida (pruebas + imagen) sin publicar
+  workflow_dispatch:     # Permite ejecutarlo manualmente desde la pestaña Actions
+
+# Principio de mínimo privilegio: cada job pide solo los permisos que necesita
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  JAVA_VERSION: "17"
+
+jobs:
+  # ===========================================================================
+  # 1. Pruebas unitarias
+  # ===========================================================================
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven      # cachea ~/.m2 entre ejecuciones
+
+      - name: Build and test
+        run: |
+          chmod +x mvnw
+          ./mvnw clean verify -B -ntp
+
+      - name: Publicar resultados de pruebas
+        if: always()
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: target/surefire-reports/TEST-*.xml
+          detailed_summary: true
+          include_passed: true
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: target/surefire-reports/
+
+  # ===========================================================================
+  # 2. Empaquetado de la aplicación
+  # ===========================================================================
+  build:
+    name: Build Jar
+    needs: test   # Solo se ejecuta si pasan las pruebas
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Package application
+        run: |
+          chmod +x mvnw
+          ./mvnw clean package -DskipTests -B -ntp   # Empaqueta sin volver a ejecutar pruebas
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-jar
+          path: target/*.jar    # Sube el .jar como artefacto del pipeline
+
+  # ===========================================================================
+  # 3. Imagen Docker: build multi-stage, prueba de health y publicación en GHCR
+  # ===========================================================================
+  docker-image:
+    name: Docker Image (build, test, push)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write          # publicar en GitHub Container Registry (GHCR)
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Calcular nombre y etiqueta de la imagen
+        id: vars
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/msinventario" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Metadatos y etiquetas (sha, rama, latest)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}   # incluye el commit (org.opencontainers.image.revision)
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Prueba de humo de la imagen (/actuator/health)
+        run: |
+          docker run -d --name msinventario-test -p 8080:8080 "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          for i in $(seq 1 30); do
+            if curl -fs http://localhost:8080/actuator/health | grep -q '"status":"UP"'; then
+              echo "Health check OK"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error title=Health check::El contenedor no respondió UP en /actuator/health"
+          docker logs msinventario-test
+          exit 1
+
+      - name: Login en GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        run: |
+          while read -r t; do
+            [ -n "$t" ] && docker push "$t"
+          done <<< "${{ steps.meta.outputs.tags }}"
+          {
+            echo "### Imagen publicada"
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Imagen | \`${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Ejecución | [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
