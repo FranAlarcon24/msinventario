@@ -1,11 +1,11 @@
 # =============================================================================
 # Pipeline CI/CD - Spring Boot (msinventario)
 #
-#   Run Tests ─> Build Jar ─> Docker Image (build + health + push GHCR) ─> Deploy Staging (Docker Compose)
+#   Run Tests (JUnit + JaCoCo) ─> Build Jar ─> Docker Image (build + health + push GHCR) ─> Deploy Staging (Docker Compose)
 #
 # Cada job depende del anterior (needs): si una etapa falla, el pipeline se detiene
 # y la imagen NO se publica.
-# Artefactos generados: test-reports, app-jar
+# Artefactos generados: test-reports, jacoco-report, app-jar
 # =============================================================================
 name: Spring Boot CI/CD Pipeline
 
@@ -34,7 +34,9 @@ env:
 
 jobs:
   # ===========================================================================
-  # 1. Pruebas unitarias
+  # 1. Pruebas unitarias e integración + cobertura con JaCoCo
+  #    "mvnw verify" falla si una prueba falla o si la cobertura de líneas
+  #    baja del mínimo definido en el pom.xml (cobertura.minima = 70 %).
   # ===========================================================================
   test:
     name: Run Tests
@@ -54,7 +56,7 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: maven      # cachea ~/.m2 entre ejecuciones
 
-      - name: Build and test
+      - name: Build and test (pruebas + reporte JaCoCo + cobertura mínima 70 %)
         run: |
           chmod +x mvnw
           ./mvnw clean verify -B -ntp
@@ -67,12 +69,36 @@ jobs:
           detailed_summary: true
           include_passed: true
 
+      - name: Resumen de cobertura (JaCoCo)
+        if: always()
+        run: |
+          CSV=target/site/jacoco/jacoco.csv
+          if [ -f "$CSV" ]; then
+            read -r MISS COV < <(awk -F, 'NR>1 {m+=$8; c+=$9} END {print m, c}' "$CSV")
+            PCT=$(awk -v c="$COV" -v m="$MISS" 'BEGIN {printf "%.1f", (c*100)/(c+m)}')
+            {
+              echo "### Cobertura de pruebas (JaCoCo)"
+              echo "| Métrica | Valor |"
+              echo "|---|---|"
+              echo "| Líneas cubiertas | $COV |"
+              echo "| Líneas sin cubrir | $MISS |"
+              echo "| **Cobertura de líneas** | **$PCT %** (mínimo exigido: 70 %) |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: test-reports
           path: target/surefire-reports/
+
+      - name: Upload JaCoCo Report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/
 
   # ===========================================================================
   # 2. Empaquetado de la aplicación
