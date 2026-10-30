@@ -72,7 +72,7 @@ jobs:
 
       - name: Install Snyk CLI (versión fija + verificación de checksum)
         run: |
-          curl -fsSL -o snyk "https://static.snyk.io/cli/v${SNYK_VERSION}/snyk-linux"
+          curl --proto "=https" --tlsv1.2 -fsSL -o snyk "https://static.snyk.io/cli/v${SNYK_VERSION}/snyk-linux"
           echo "${SNYK_SHA256}  snyk" | sha256sum -c -
           sudo install -m 0755 snyk /usr/local/bin/snyk
           rm snyk
@@ -361,7 +361,7 @@ jobs:
 
       - name: Install Snyk CLI (versión fija + verificación de checksum)
         run: |
-          curl -fsSL -o snyk "https://static.snyk.io/cli/v${SNYK_VERSION}/snyk-linux"
+          curl --proto "=https" --tlsv1.2 -fsSL -o snyk "https://static.snyk.io/cli/v${SNYK_VERSION}/snyk-linux"
           echo "${SNYK_SHA256}  snyk" | sha256sum -c -
           sudo install -m 0755 snyk /usr/local/bin/snyk
           rm snyk
