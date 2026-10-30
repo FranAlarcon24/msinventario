@@ -7,7 +7,8 @@ RUN mvn package -DskipTests -B
 
 FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
-RUN addgroup -S app && adduser -S app -G app
+# Aplica parches de seguridad de Alpine sobre la imagen base (ej. brotli CVE-2026-111497)
+RUN apk upgrade --no-cache && addgroup -S app && adduser -S app -G app
 COPY --from=build /app/target/*.jar app.jar
 USER app
 EXPOSE 8080

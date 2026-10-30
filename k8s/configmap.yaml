@@ -1,0 +1,13 @@
+# Configuración del microservicio separada del código y de la imagen.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: msinventario-config
+  labels:
+    app.kubernetes.io/name: msinventario
+data:
+  # Activa /actuator/health/liveness y /actuator/health/readiness (usados por las probes)
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  # La JVM usa como máximo el 75 % de la memoria límite del contenedor
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+  APP_ENV: produccion-k8s
